@@ -14,6 +14,7 @@ Config.ESX = {
     table = 'owned_vehicles',
     plateColumn = 'plate',
     jobColumn = 'job', -- ensure this column exists in your DB
+    jobPersonalColumn = 'job_personalowned', -- for personal ownership flag
     ownerColumn = 'owner', -- identifier/license/steam depending on your ESX setup
 }
 
@@ -21,6 +22,7 @@ Config.QB = {
     table = 'player_vehicles',
     plateColumn = 'plate',
     jobColumn = 'job', -- ensure this column exists in your DB
+    jobPersonalColumn = 'job_personalowned', -- adjust/remove if not present in QB schema
     ownerColumn = 'citizenid',
 }
 

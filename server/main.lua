@@ -38,64 +38,80 @@ lib.callback.register('jobvehicle:getJobName', function(source)
     return getPlayerJob(source)
 end)
 
--- Check if the current player owns a vehicle with given plate
-lib.callback.register('jobvehicle:isOwnerOfPlate', function(source, plate)
-    if type(plate) ~= 'string' then return false end
+-- Helpers: plate variants and DB map
+local function plateVariants(raw)
+    local withSpaces = tostring(raw or '')
+    local trimmed = withSpaces:gsub('%s+', '')
+    local mixed = trimmed
+    if #trimmed > 3 and not withSpaces:match('%s') then
+        mixed = trimmed:sub(1, 3) .. ' ' .. trimmed:sub(4)
+    elseif withSpaces:match('%s') then
+        mixed = trimmed
+    end
+    return trimmed, withSpaces, mixed
+end
+
+local function getDBMap()
+    if Config.Framework == 'ESX' then
+        return Config.ESX.table, Config.ESX.plateColumn, Config.ESX.jobColumn, Config.ESX.jobPersonalColumn, (Config.ESX.ownerColumn or 'owner')
+    elseif Config.Framework == 'QB' then
+        return Config.QB.table, Config.QB.plateColumn, Config.QB.jobColumn, Config.QB.jobPersonalColumn, (Config.QB.ownerColumn or 'citizenid')
+    else
+        return nil
+    end
+end
+
+local function getOwnerId(src)
+    if Config.Framework == 'ESX' and ESX then
+        local xPlayer = ESX.GetPlayerFromId(src)
+        return xPlayer and xPlayer.identifier or nil
+    elseif Config.Framework == 'QB' and QBCore then
+        local Player = QBCore.Functions.GetPlayer(src)
+        return Player and Player.PlayerData and Player.PlayerData.citizenid or nil
+    end
+    return nil
+end
+
+-- Local function to check ownership using plate variants
+local function isOwnerOfPlate(src, rawPlate)
+    if type(rawPlate) ~= 'string' then return false end
     if not Config.RequireOwnership then return true end
 
-    local safePlate = plate:gsub('%s+', '')
+    local tableName, plateCol, _, _, ownerCol = getDBMap()
+    if not tableName then return false end
 
-    local tableName, plateCol, ownerCol, ownerId
+    local ownerId = getOwnerId(src)
+    if not ownerId then return false end
 
-    if Config.Framework == 'ESX' and ESX then
-        local xPlayer = ESX.GetPlayerFromId(source)
-        if not xPlayer then return false end
-        ownerId = xPlayer.identifier
-        tableName = Config.ESX.table
-        plateCol = Config.ESX.plateColumn
-        ownerCol = Config.ESX.ownerColumn or 'owner'
-
-    elseif Config.Framework == 'QB' and QBCore then
-        local Player = QBCore.Functions.GetPlayer(source)
-        if not Player then return false end
-        ownerId = Player.PlayerData.citizenid
-        tableName = Config.QB.table
-        plateCol = Config.QB.plateColumn
-        ownerCol = Config.QB.ownerColumn or 'citizenid'
-
-    elseif Config.Framework == 'CUSTOM' then
-        -- Implement your own ownership check here
-        return false
-    else
-        return false
-    end
-
-    local query = ('SELECT 1 FROM `%s` WHERE `%s` = ? AND `%s` = ? LIMIT 1')
-        :format(tableName, plateCol, ownerCol)
-
+    local t, r, m = plateVariants(rawPlate)
+    local query = ('SELECT 1 FROM `%s` WHERE `%s` = ? AND `%s` IN (?, ?, ?) LIMIT 1')
+        :format(tableName, ownerCol, plateCol)
     local exists
     local ok, err = pcall(function()
-        exists = MySQL.scalar.await(query, { safePlate, ownerId }) ~= nil
+        exists = MySQL.scalar.await(query, { ownerId, t, r, m }) ~= nil
     end)
     if not ok then
         print(('[jobvehicle] SQL error (ownership check): %s'):format(err))
         return false
     end
-
     return exists
+end
+
+-- Server callback for client-side ownership check
+lib.callback.register('jobvehicle:isOwnerOfPlate', function(source, plate)
+    return isOwnerOfPlate(source, plate)
 end)
 
-RegisterNetEvent('jobvehicle:setVehicleJob', function(plate)
+RegisterNetEvent('jobvehicle:setVehicleJob', function(rawPlate, action)
     local src = source
 
-    if type(plate) ~= 'string' then
+    if type(rawPlate) ~= 'string' or rawPlate == '' then
         TriggerClientEvent('jobvehicle:result', src, false, 'Chybná SPZ (plate).')
         return
     end
 
-    -- enforce ownership server-side as well
-    local isOwner = lib.callback.await('jobvehicle:isOwnerOfPlate', src, plate)
-    if not isOwner then
+    -- enforce ownership server-side as well (direct check)
+    if not isOwnerOfPlate(src, rawPlate) then
         TriggerClientEvent('jobvehicle:result', src, false, 'Toto vozidlo nevlastníš.')
         return
     end
@@ -106,39 +122,54 @@ RegisterNetEvent('jobvehicle:setVehicleJob', function(plate)
         return
     end
 
-    local safePlate = plate:gsub('%s+', '')
+    local t, r, m = plateVariants(rawPlate)
 
     if not Config.EnableDatabaseUpdate then
-        print(('[jobvehicle] Simulace: nastavuji job=%s pro SPZ=%s'):format(job, safePlate))
-        TriggerClientEvent('jobvehicle:result', src, true, ('Simulace: SPZ %s přiřazena práci %s.'):format(safePlate, job), job)
+        print(('[jobvehicle] Simulace: nastavuji job=%s pro SPZ varianty: %s | %s | %s'):format(job, t, r, m))
+        TriggerClientEvent('jobvehicle:result', src, true, ('Simulace: SPZ přiřazena práci %s.'):format(job), job)
         return
     end
 
-    local tableName, plateCol, jobCol
-    if Config.Framework == 'ESX' then
-        tableName = Config.ESX.table
-        plateCol = Config.ESX.plateColumn
-        jobCol = Config.ESX.jobColumn
-    elseif Config.Framework == 'QB' then
-        tableName = Config.QB.table
-        plateCol = Config.QB.plateColumn
-        jobCol = Config.QB.jobColumn
-    elseif Config.Framework == 'CUSTOM' then
+    local tableName, plateCol, jobCol, jobPersonalCol, ownerCol = getDBMap()
+    if not tableName then
+        TriggerClientEvent('jobvehicle:result', src, false, 'Neznámý framework v configu.')
+        return
+    end
+
+    if Config.Framework == 'CUSTOM' then
         -- Do your own SQL here if using custom framework
         -- Example:
         -- local affected = MySQL.update.await('UPDATE my_table SET job = ? WHERE plate = ?', { job, safePlate })
         -- TriggerClientEvent('jobvehicle:result', src, affected and affected > 0, affected and 'OK' or 'SPZ nenalezena', job)
         TriggerClientEvent('jobvehicle:result', src, false, 'CUSTOM mód není nastaven.')
         return
-    else
-        TriggerClientEvent('jobvehicle:result', src, false, 'Neznámý framework v configu.')
-        return
     end
 
-    local query = ('UPDATE `%s` SET `%s` = ? WHERE `%s` = ?'):format(tableName, jobCol, plateCol)
+    local mode = type(action) == 'string' and action:lower() or 'society'
+    if mode ~= 'personal' then mode = 'society' end
+
+    local query, params
+    if mode == 'society' then
+        if not jobCol or jobCol == '' or not ownerCol or ownerCol == '' then
+            TriggerClientEvent('jobvehicle:result', src, false, 'DB sloupce (job/owner) nejsou správně nastavené.')
+            return
+        end
+        query = ('UPDATE `%s` SET `%s` = ?, `%s` = ? WHERE `%s` IN (?, ?, ?)')
+            :format(tableName, jobCol, ownerCol, plateCol)
+        params = { job, job, t, r, m }
+    else -- personal
+        if not jobPersonalCol or jobPersonalCol == '' then
+            TriggerClientEvent('jobvehicle:result', src, false, 'DB sloupec pro osobní vlastnictví není nastaven.')
+            return
+        end
+        query = ('UPDATE `%s` SET `%s` = ? WHERE `%s` IN (?, ?, ?)')
+            :format(tableName, jobPersonalCol, plateCol)
+        params = { job, t, r, m }
+    end
+
     local affected
     local ok, err = pcall(function()
-        affected = MySQL.update.await(query, { job, safePlate })
+        affected = MySQL.update.await(query, params)
     end)
 
     if not ok then
@@ -148,8 +179,8 @@ RegisterNetEvent('jobvehicle:setVehicleJob', function(plate)
     end
 
     if affected and affected > 0 then
-        TriggerClientEvent('jobvehicle:result', src, true, ('Vozidlo %s bylo přepsáno na práci %s.'):format(safePlate, job), job)
+        TriggerClientEvent('jobvehicle:result', src, true, ('Vozidlo bylo přepsáno na práci %s (%s).'):format(job, mode), job)
     else
-        TriggerClientEvent('jobvehicle:result', src, false, ('Vozidlo se SPZ %s nebylo nalezeno v databázi.'):format(safePlate))
+        TriggerClientEvent('jobvehicle:result', src, false, 'Vozidlo se zadanou SPZ nebylo nalezeno v databázi.')
     end
 end)
